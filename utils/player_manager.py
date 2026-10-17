@@ -1,4 +1,5 @@
 import os
+import queue
 import re
 import threading
 import time
@@ -24,6 +25,7 @@ class BaseInit:
         self.playlist_data = {}
         self.playlist_time = {}
         self.playlist_total_sec = {}
+        self._submitted_playlist_time = {}
         self.is_http_sub = bool(data.get('sub_file'))
         self.emby_thin = EmbyApiThin(data)
 
@@ -107,7 +109,37 @@ class BaseManager(BaseInit):
             logger.info('disable playlist cuz http sub, auto next ep mode enabled')
             self.http_sub_auto_next_ep_time_loop(key_field=key_field_map[self.player_name])
         else:
-            stop_fun_res = stop_sec_func_dict[self.player_name](stop_sec_only=False, **self.player_kwargs)
+            if self.player_name in ('mpv', 'iina'):
+                progress_queue = queue.Queue()
+
+                def submit_progress():
+                    while True:
+                        progress = progress_queue.get()
+                        if progress is None:
+                            return
+                        key, stop_sec, total_sec = progress
+                        try:
+                            self.update_playback_for_eps(
+                                playlist_time={key: stop_sec}, playlist_total_sec={key: total_sec})
+                        except Exception as exc:
+                            logger.error(f'playlist progress update failed: {type(exc).__name__}; '
+                                         'will retry on player exit')
+
+                def on_episode_end(key, stop_sec, total_sec):
+                    logger.info(f'mpv playlist switch, queue progress: {key} stop_sec={stop_sec}')
+                    progress_queue.put((key, stop_sec, total_sec))
+
+                progress_thread = threading.Thread(target=submit_progress, daemon=True)
+                progress_thread.start()
+                try:
+                    stop_fun_res = stop_sec_func_dict[self.player_name](
+                        stop_sec_only=False, on_episode_end=on_episode_end, **self.player_kwargs)
+                finally:
+                    # Drain earlier episodes before the final flush, preserving submission order.
+                    progress_queue.put(None)
+                    progress_thread.join()
+            else:
+                stop_fun_res = stop_sec_func_dict[self.player_name](stop_sec_only=False, **self.player_kwargs)
             if isinstance(stop_fun_res, tuple):
                 self.playlist_time, self.playlist_total_sec = stop_fun_res
             else:
@@ -129,12 +161,24 @@ class BaseManager(BaseInit):
             logger.info(f'prefetch_next_ep_playback_info {next_ep["basename"]}')
             self.emby_thin.get_playback_info(next_ep['item_id'], timeout=60)
 
-    def update_playback_for_eps(self):
+    def _submit_playback_progress(self, key, stop_sec, ep):
+        try:
+            update_server_playback_progress(stop_sec=stop_sec, data=ep)
+        except Exception as exc:
+            logger.error(f'update progress failed: {ep["basename"]}, {type(exc).__name__}; '
+                         'will retry on player exit')
+            return False
+        self._submitted_playlist_time[key] = stop_sec
+        return True
+
+    def update_playback_for_eps(self, playlist_time=None, playlist_total_sec=None):
+        playlist_time = self.playlist_time if playlist_time is None else playlist_time
+        playlist_total_sec = self.playlist_total_sec if playlist_total_sec is None else playlist_total_sec
         need_update_eps = []
         if not self.playlist_data:
             logger.error(f'skip update progress: playlist_data not found')
             return
-        for key, _stop_sec in self.playlist_time.items():
+        for key, _stop_sec in playlist_time.items():
             ep = self.playlist_data.get(key)
             if not ep:
                 logger.error(f'skip update progress: {key=} {_stop_sec=} not in playlist_data')
@@ -143,12 +187,14 @@ class BaseManager(BaseInit):
                 continue
             start_sec = ep.get('start_sec') or 0
             _stop_sec = int(_stop_sec)
+            if self._submitted_playlist_time.get(key) == _stop_sec:
+                continue
             if abs(_stop_sec - int(start_sec)) < 20:
                 logger.info(f"skip update progress, {ep['basename']} start_sec stop_sec too close")
                 continue
             ep['_stop_sec'] = _stop_sec
             emby_strm_miss_runtime = bool(ep['server'] != 'plex' and ep['total_sec'] == 3600 * 24)
-            mpv_total_sec = self.playlist_total_sec.get(key)
+            mpv_total_sec = playlist_total_sec.get(key)
             need_recheck = emby_strm_miss_runtime and bool(not mpv_total_sec or _stop_sec / mpv_total_sec < 0.9)
             if need_recheck:
                 # 注意：仅限启用播放列表时候有这些处理，strm 缺失 total_sec 和 缓存播放进度
@@ -165,14 +211,15 @@ class BaseManager(BaseInit):
                     check_miss_runtime_start_sec(netloc, item_id, basename, stop_sec=_stop_sec)
                     logger.info(f'strm: recheck failed, cache start_sec={_stop_sec} | {basename}')
 
-                total_sec = self.playlist_total_sec.get(key) or _total_sec
+                total_sec = mpv_total_sec or _total_sec
                 _skip = True
                 if total_sec:
                     ep['total_sec'] = total_sec
                     if _stop_sec / total_sec > 0.9 or _total_sec:
-                        update_server_playback_progress(stop_sec=_stop_sec, data=ep)
-                        _skip = False
+                        _skip = not self._submit_playback_progress(key, _stop_sec, ep)
                 _skip and logger.info(f"skip update progress, {ep['basename']} miss runtime data")
+                if _skip:
+                    continue
             else:
                 if emby_strm_miss_runtime and mpv_total_sec:
                     ep['total_sec'] = mpv_total_sec
@@ -182,7 +229,8 @@ class BaseManager(BaseInit):
                 # # simkl 插件有全局 30 秒静默冷却时间，以及只回传首次。
                 # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='playing')
                 # realtime_playing_request_sender(cur_sec=_stop_sec, data=ep, method='end')
-                update_server_playback_progress(stop_sec=_stop_sec, data=ep)
+                if not self._submit_playback_progress(key, _stop_sec, ep):
+                    continue
             need_update_eps.append(ep)
         threading.Thread(target=self.prefetch_next_ep_playback_info, daemon=True).start()
         if not need_update_eps:

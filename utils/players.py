@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 from utils.configs import configs, MyLogger
 from utils.data_parser import list_episodes
 from utils.net_tools import requests_urllib, save_sub_file
-from utils.python_mpv_jsonipc import MPV
+from utils.python_mpv_jsonipc import MPV, MPVError
 from utils.tools import activate_window_by_pid
 
 logger = MyLogger()
@@ -309,13 +309,14 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
     return playlist_data
 
 
-def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
+def stop_sec_mpv(mpv: MPV, stop_sec_only=True, on_episode_end=None, **_):
     if not mpv:
         logger.error('mpv not found, skip stop_sec_mpv')
         return None if stop_sec_only else {}
     stop_sec = None
     name_stop_sec_dict = {}
     name_total_sec_dict = {}
+    last_media_title = None
 
     chapters_dict = {}
     chapter_skipped = []
@@ -337,11 +338,22 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
         try:
             media_title = mpv.command('get_property', 'media-title')
             tmp_sec = mpv.command('get_property', 'time-pos')
+            # A file can change between IPC requests. Never pair the old title with the new position.
+            if media_title != mpv.command('get_property', 'media-title'):
+                time.sleep(0.1)
+                continue
+            if media_title and media_title != last_media_title and tmp_sec:
+                if last_media_title and not stop_sec_only and on_episode_end:
+                    on_episode_end(last_media_title, name_stop_sec_dict[last_media_title],
+                                   name_total_sec_dict.get(last_media_title))
+                last_media_title = media_title
+                if total_sec := mpv.command('get_property', 'duration'):
+                    name_total_sec_dict[media_title] = total_sec
 
             chapters_raw = mpv.command('get_property', 'chapter-list') if dura_start else None
             chapter_index = mpv.command('get_property', 'chapter') if dura_start else None
             chapter_unique = f'{media_title}-{chapter_index}' if dura_start else None
-            if not tmp_sec:
+            if not media_title or not tmp_sec:
                 print('.', end='')
             else:
                 stop_sec = tmp_sec
@@ -386,6 +398,10 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
                         logger.info(f'intro found, go to next chapter, {title_log}')
                     chapter_skipped.append(chapter_unique)
             time.sleep(0.5)
+        except MPVError:
+            # Property errors during file transitions do not mean the IPC connection has closed.
+            time.sleep(0.5)
+            continue
         except Exception:
             stop_sec = stop_sec and int(stop_sec)
             logger.info(f'mpv exit, return stop sec, {stop_sec=}')

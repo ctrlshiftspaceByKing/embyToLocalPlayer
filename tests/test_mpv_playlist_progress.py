@@ -72,14 +72,66 @@ class ScriptedMpv:
         raise AssertionError((command, prop))
 
 
+class PlexState:
+    """Model the real server: timeline is acknowledged but ignored for later items."""
+    def __init__(self):
+        self.items = {}
+        self.drop_updates = {}
+        self.drop_scrobbles = {}
+        self.ignored_items = set()
+        self.wrong_metadata_key = False
+
+    def request(self, url, params=None, **kwargs):
+        path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+        params = params or {}
+        if path == '/:/timeline':
+            return ''  # Reproduce the observed HTTP 200 without a saved playback record.
+        if path in ('/:/progress', '/:/scrobble', '/:/unscrobble'):
+            key = str(params['key'])
+            assert params.get('identifier') == 'com.plexapp.plugins.library'
+            if path == '/:/progress':
+                self.ignored_items.discard(key)
+                remaining = self.drop_updates.get(key, 0)
+                if remaining:
+                    self.drop_updates[key] = remaining - 1
+                    self.ignored_items.add(key)
+                    return ''
+            if key in self.ignored_items:
+                return ''
+            item = self.items.setdefault(key, {'ratingKey': key, 'viewOffset': 0,
+                                              'viewCount': 0, 'duration': 120000})
+            if path == '/:/progress':
+                item['viewOffset'] = int(params['time'])
+            elif path == '/:/scrobble':
+                remaining = self.drop_scrobbles.get(key, 0)
+                if remaining:
+                    self.drop_scrobbles[key] = remaining - 1
+                    return ''
+                item['viewCount'] += 1
+                item['viewOffset'] = 0
+            else:
+                item['viewCount'] = 0
+        elif path.startswith('/library/metadata/'):
+            key = path.rsplit('/', 1)[-1]
+            item = self.items.get(key, {'ratingKey': key, 'viewOffset': 0, 'viewCount': 0, 'duration': 120000})
+            if self.wrong_metadata_key:
+                item = dict(item, ratingKey='wrong-episode')
+            return {'MediaContainer': {'Metadata': [dict(item)]}}
+        else:
+            raise AssertionError('Unexpected Plex endpoint: ' + path)
+        return ''
+
+
 def make_environment():
     raw = configparser.ConfigParser(interpolation=None)
     raw.read_dict({'dev': {}, 'emby': {'update_progress': 'yes'}, 'playlist': {}})
     configs = types.SimpleNamespace(raw=raw, ini_str_split=lambda *a, **kw: [], script_proxy='')
+    plex_state = PlexState()
     ns = dict(configs=configs, logger=Mock(), queue=queue, threading=threading, time=time,
               os=os, json=json, urllib=urllib, ssl_context=None, MPV=object, MPVError=PropertyError,
               EmbyApiThin=lambda data: None, sync_third_party_for_eps=Mock(),
-              prefetch_data={'on': True, 'stop_sec_dict': {}}, requests_urllib=Mock(return_value=''))
+              prefetch_data={'on': True, 'stop_sec_dict': {}}, plex_state=plex_state,
+              requests_urllib=Mock(side_effect=plex_state.request))
     load_definitions('utils/net_tools.py', {'change_plex_play_position', 'update_server_playback_progress'}, ns)
     load_definitions('utils/players.py', {'stop_sec_mpv', 'playlist_add_mpv'}, ns)
     ns['stop_sec_func_dict'] = {'mpv': ns['stop_sec_mpv'], 'iina': ns['stop_sec_mpv']}
@@ -106,13 +158,16 @@ class PlaylistProgressTests(unittest.TestCase):
 
     def run_frames(self, frames):
         mpv = ScriptedMpv(frames)
-        self.ns['time'] = types.SimpleNamespace(sleep=mpv.sleep)
+        collector_thread = threading.current_thread()
+        self.ns['time'] = types.SimpleNamespace(
+            sleep=lambda seconds: mpv.sleep(seconds) if threading.current_thread() is collector_thread else None)
         self.manager.player_kwargs = {'mpv': mpv}
         self.manager.update_playlist_time_loop()
 
     def requests(self):
-        return [call.kwargs['params'] for call in self.ns['requests_urllib'].call_args_list
-                if call.args[0].endswith('/:/timeline')]
+        return [dict(call.kwargs['params'], ratingKey=str(call.kwargs['params']['key']))
+                for call in self.ns['requests_urllib'].call_args_list
+                if call.args[0].endswith('/:/progress')]
 
     def test_each_episode_submitted_at_switch_and_current_on_close(self):
         self.run_frames([('S01E01', 40), ('S01E01', 119), ('S01E02', 1),
@@ -220,33 +275,106 @@ class PlaylistProgressTests(unittest.TestCase):
         self.manager.update_playback_for_eps()
         self.assertEqual(self.requests()[0]['time'], 58000)
 
+    def test_plex_request_identifies_each_library_item(self):
+        self.run_frames([('S01E01', 119), ('S01E02', 118), ('S01E03', 45)])
+        self.manager.update_playback_for_eps()
+        for params in self.requests():
+            self.assertEqual(params.get('key'), params['ratingKey'])
+            self.assertEqual(params.get('identifier'), 'com.plexapp.plugins.library')
+
+    def test_five_episode_persisted_state_including_all_middle_episodes(self):
+        self.manager = make_manager(self.ns, count=5)
+        self.run_frames([(f'S01E{i:02}', 119 if i < 5 else 45) for i in range(1, 6)])
+        self.assertEqual(set(self.ns['plex_state'].items), {'1', '2', '3', '4'})
+        self.manager.update_playback_for_eps()
+        items = self.ns['plex_state'].items
+        self.assertEqual(set(items), {'1', '2', '3', '4', '5'})
+        self.assertTrue(all(items[str(i)]['viewCount'] == 1 for i in range(1, 5)))
+        self.assertEqual(items['5']['viewCount'], 0)
+        self.assertEqual(items['5']['viewOffset'], 43000)
+
+    def test_http_200_with_ignored_middle_episode_is_retried(self):
+        self.manager = make_manager(self.ns, count=5)
+        self.ns['plex_state'].drop_updates['3'] = 1
+        self.run_frames([(f'S01E{i:02}', 119 if i < 5 else 45) for i in range(1, 6)])
+        self.manager.update_playback_for_eps()
+        self.assertEqual(set(self.ns['plex_state'].items), {'1', '2', '3', '4', '5'})
+        self.assertEqual([r['ratingKey'] for r in self.requests()].count('3'), 2)
+
+    def test_unsaved_progress_is_not_deduplicated_and_retries_on_close(self):
+        self.ns['plex_state'].drop_updates['1'] = 2
+        self.run_frames([('S01E01', 119), ('S01E02', 50)])
+        self.assertNotIn('S01E01', self.manager._submitted_playlist_time)
+        self.manager.update_playback_for_eps()
+        self.assertEqual(set(self.ns['plex_state'].items), {'1', '2'})
+
+    def test_wrong_episode_readback_cannot_confirm_submission(self):
+        self.ns['plex_state'].wrong_metadata_key = True
+        self.run_frames([('S01E01', 119), ('S01E02', 50)])
+        self.manager.update_playback_for_eps()
+        self.assertEqual(self.manager._submitted_playlist_time, {})
+
+    def test_incomplete_episode_updates_resume_without_marking_watched(self):
+        self.run_frames([('S01E01', 60)])
+        self.manager.update_playback_for_eps()
+        self.assertEqual(self.ns['plex_state'].items['1']['viewOffset'], 58000)
+        self.assertEqual(self.ns['plex_state'].items['1']['viewCount'], 0)
+        self.assertFalse(any(call.args[0].endswith('/:/scrobble')
+                             for call in self.ns['requests_urllib'].call_args_list))
+
+    def test_saved_end_position_without_watched_flag_is_not_success(self):
+        self.ns['plex_state'].drop_scrobbles['1'] = 2
+        self.run_frames([('S01E01', 119), ('S01E02', 50)])
+        self.assertNotIn('S01E01', self.manager._submitted_playlist_time)
+        self.assertEqual(self.ns['plex_state'].items['1']['viewCount'], 0)
+        self.manager.update_playback_for_eps()
+        self.assertEqual(self.ns['plex_state'].items['1']['viewCount'], 1)
+
+    def test_repeated_completed_submission_does_not_increment_watch_count(self):
+        ep = self.manager.playlist_data['S01E01']
+        self.ns['change_plex_play_position'](stop_sec=117, **ep)
+        self.ns['change_plex_play_position'](stop_sec=117, **ep)
+        self.assertEqual(self.ns['plex_state'].items['1']['viewCount'], 1)
+        self.assertEqual(len(self.requests()), 1)
+
+    def test_unknown_duration_does_not_mark_watched(self):
+        self.ns['plex_state'].items['1'] = {'ratingKey': '1', 'viewCount': 0, 'viewOffset': 0, 'duration': 0}
+        ep = dict(self.manager.playlist_data['S01E01'], duration=0)
+        self.ns['change_plex_play_position'](stop_sec=117, **ep)
+        self.assertEqual(self.ns['plex_state'].items['1']['viewCount'], 0)
+        self.assertEqual(self.ns['plex_state'].items['1']['viewOffset'], 117000)
+
 
 @unittest.skipUnless(os.environ.get('ETLP_TEST_REAL_MPV') == '1' and shutil.which('mpv') and os.name != 'nt',
                      'set ETLP_TEST_REAL_MPV=1 to run real mpv integration')
 class RealMpvProgressTests(unittest.TestCase):
-    def test_three_episodes_natural_transitions_then_quit(self):
+    def test_five_episodes_persist_all_middle_episodes_then_quit(self):
         ns = make_environment()
         load_definitions('utils/net_tools.py', {'safe_url', 'requests_urllib'}, ns)
         spec = importlib.util.spec_from_file_location('test_mpv_jsonipc', ROOT / 'utils/python_mpv_jsonipc.py')
         ipc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ipc)
         ns['MPVError'] = ipc.MPVError
-        manager = make_manager(ns)
+        manager = make_manager(ns, count=5)
         requests = []
+        plex_state = PlexState()
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 parts = urllib.parse.urlsplit(self.path)
-                if urllib.parse.unquote(parts.path) == '/:/timeline':
+                params = {key: values[0] for key, values in urllib.parse.parse_qs(parts.query).items()}
+                if urllib.parse.unquote(parts.path) == '/:/progress':
                     requests.append(urllib.parse.parse_qs(parts.query))
+                body = plex_state.request('http://localhost' + parts.path, params=params)
                 self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(b'{}')
+                self.wfile.write(json.dumps(body or {}).encode())
 
             def log_message(self, *args):
                 pass
 
-        def wait_until(predicate, timeout=25):
+        def wait_until(predicate, timeout=80):
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if predicate():
@@ -280,7 +408,7 @@ class RealMpvProgressTests(unittest.TestCase):
             with open(Path(temp) / 'mpv.log', 'w') as log:
                 process = subprocess.Popen([
                     'mpv', '--no-config', '--vo=null', '--ao=null', '--idle=yes', '--pause=yes',
-                    '--speed=20', '--audio-pitch-correction=no', '--force-media-title=S01E01',
+                    '--speed=8', '--audio-pitch-correction=no', '--force-media-title=S01E01',
                     '--input-ipc-server=' + socket_path, paths[0]], stdout=log, stderr=log)
                 try:
                     wait_until(lambda: Path(socket_path).exists())
@@ -301,29 +429,36 @@ class RealMpvProgressTests(unittest.TestCase):
                     collector = threading.Thread(target=collect, daemon=True)
                     collector.start()
                     mpv.command('set_property', 'pause', False)
-                    wait_until(lambda: len(mpv.command('get_property', 'playlist')) == 3)
-                    wait_until(lambda: len(requests) >= 2)
-                    self.assertIsNone(process.poll(), 'First two episodes must report before mpv exits')
-                    self.assertEqual([r['ratingKey'][0] for r in requests], ['1', '2'])
-                    wait_until(lambda: mpv.command('get_property', 'media-title') == 'S01E03'
+                    wait_until(lambda: len(mpv.command('get_property', 'playlist')) == 5)
+                    wait_until(lambda: all(plex_state.items.get(str(i), {}).get('viewCount', 0) > 0
+                                           for i in range(1, 5)))
+                    self.assertIsNone(process.poll(), 'All four earlier episodes must report before mpv exits')
+                    self.assertEqual([r['key'][0] for r in requests], ['1', '2', '3', '4'])
+                    self.assertEqual(set(plex_state.items), {'1', '2', '3', '4'})
+                    self.assertTrue(all(plex_state.items[str(i)]['viewCount'] == 1 for i in range(1, 5)))
+                    wait_until(lambda: mpv.command('get_property', 'media-title') == 'S01E05'
                                and (mpv.command('get_property', 'time-pos') or 0) >= 45)
                     time.sleep(0.6)  # Allow the production sampler to retain the current position.
-                    self.assertEqual(len(requests), 2, 'Current episode is flushed on quit')
+                    self.assertEqual(len(requests), 4, 'Current episode is flushed on quit')
                     mpv.command('quit')
                     process.wait(timeout=5)
                     collector.join(timeout=10)
                     self.assertFalse(collector.is_alive(), 'Progress collector must finish after quit')
                     self.assertEqual(errors, [])
-                    self.assertEqual([r['ratingKey'][0] for r in requests], ['1', '2', '3'])
+                    self.assertEqual([r['key'][0] for r in requests], ['1', '2', '3', '4', '5'])
+                    self.assertEqual(set(plex_state.items), {'1', '2', '3', '4', '5'})
+                    self.assertEqual(plex_state.items['5']['viewCount'], 0)
+                    self.assertEqual(plex_state.items['5']['viewOffset'], int(requests[-1]['time'][0]))
                     for request in requests:
-                        self.assertEqual(request['state'], ['stopped'])
+                        self.assertEqual(request['identifier'], ['com.plexapp.plugins.library'])
                         self.assertGreater(int(request['time'][0]), 20000)
                         self.assertLessEqual(int(request['time'][0]), 120000)
                     for key, ep in manager.playlist_data.items():
-                        request = next(r for r in requests if r['ratingKey'] == [ep['rating_key']])
+                        request = next(r for r in requests if r['key'] == [ep['rating_key']])
                         self.assertEqual(int(request['time'][0]), (int(manager.playlist_time[key]) - 2) * 1000)
-                    print('\nReal mpv verified (local Plex endpoint): ' + repr([
-                        (r['ratingKey'][0], int(r['time'][0]) / 1000) for r in requests]), flush=True)
+                    print('\nReal mpv verified (stateful local Plex endpoint): ' + repr([
+                        (key, item['viewCount'], item['viewOffset'])
+                        for key, item in plex_state.items.items()]), flush=True)
                 finally:
                     if process.poll() is None:
                         process.terminate()

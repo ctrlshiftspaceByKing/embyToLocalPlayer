@@ -490,7 +490,7 @@ def _prefetch_resume_tv(emby_thin: EmbyApiThin, startswith, fetch_type=''):
                 host = emby_thin.host
                 image = f'[ ]({host}/emby/Items/{item_id}/Images/Primary?maxHeight=282&maxWidth=500)'
                 item_url = f"[emby]({host}/web/index.html#!/item?id={item_id}&serverId={ep['ServerId']})"
-                notify_msg = f"{image}{ep['SeriesName']} \| `{time.ctime()}` \| {item_url}"
+                notify_msg = f"{image}{ep['SeriesName']} \\| `{time.ctime()}` \\| {item_url}"
 
                 media_sources = playback_info['MediaSources']
                 ep_source_name = [m['Name'] for m in media_sources if m['Name'] in ep_basename][0]

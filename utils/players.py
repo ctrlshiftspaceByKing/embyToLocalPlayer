@@ -27,8 +27,10 @@ class MpvPersonal:
 
     def __init__(self, data, bind_cmd):
         self.series_key = ''
-        if series_name := data.get('SeriesName'):
-            self.series_key = f'{series_name}-{data["SeriesId"]}'
+        if data and isinstance(data, dict):
+            if series_name := (data.get('SeriesName') or data.get('grandparentTitle')):
+                series_id = data.get('SeriesId') or data.get('grandparentRatingKey') or ''
+                self.series_key = f'{series_name}-{series_id}'
         self.bind_cmd = bind_cmd
         if bind_cmd not in self.settings:
             raise ValueError(f'bind_cmd must in {self.settings.keys()}')
@@ -119,7 +121,8 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
             pass
         else:
             cmd.append(f'--start={start_sec}')
-    p_start = MpvPersonal(data['main_ep_info'], 'intro_start')
+    main_ep_info = (data.get('main_ep_info') or data) if isinstance(data, dict) else {}
+    p_start = MpvPersonal(main_ep_info, 'intro_start')
     intro_cached = p_start.get()
     if not start_sec and intro_cached:
         cmd.append(f'--start={intro_cached}')
@@ -163,19 +166,20 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
                     callbacks = {i for i in callbacks if 'fist_ep_intro_adder' not in str(i)}
                     mpv.event_bindings[event_name] = callbacks
 
-    @mpv.on_event('client-message')
-    def cache_intro_start(msg):
-        args = msg['args']
-        if len(args) == 2 and args[0] == 'intro-start-sec':
-            p_start.set(int(args[1]))
-            logger.info(f'lua set found, {p_start.settings}')
+    if mpv:
+        @mpv.on_event('client-message')
+        def cache_intro_start(msg):
+            args = msg['args']
+            if len(args) == 2 and args[0] == 'intro-start-sec':
+                p_start.set(int(args[1]))
+                logger.info(f'lua set found, {p_start.settings}')
 
-    intro_cached and mpv.command('script-message', 'etlp-intro-cached', intro_cached)
-    if not get_stop_sec:
-        return
-    mpv.command('script-message', 'etlp-cmd-pipe', cmd_pipe)
-    mpv.is_iina = is_iina
-    mpv.is_mpvnet = is_mpvnet
+        intro_cached and mpv.command('script-message', 'etlp-intro-cached', intro_cached)
+        if not get_stop_sec:
+            return
+        mpv.command('script-message', 'etlp-cmd-pipe', cmd_pipe)
+        mpv.is_iina = is_iina
+        mpv.is_mpvnet = is_mpvnet
     return dict(mpv=mpv)
 
 

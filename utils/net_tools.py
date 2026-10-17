@@ -40,7 +40,7 @@ def tg_notify(msg, silence=False):
     if not chat_id:
         return
     if msg == '_get_chat_id':
-        msg = f'message test success\n`chat_id = {chat_id}`\nneed to set `get_chat_id \= no`'
+        msg = f'message test success\n`chat_id = {chat_id}`\nneed to set `get_chat_id = no`'
     if silence_time:
         silence_time = [range(int(start), int(end)) for (start, end) in
                         [time_range.split('-') for time_range in silence_time]]
@@ -275,31 +275,54 @@ def change_jellyfin_play_position(scheme, netloc, item_id, stop_sec, play_sessio
 
 def change_plex_play_position(scheme, netloc, api_key, stop_sec, rating_key, client_id, duration, **_):
     if stop_sec > 10 * 60 * 60:
-        logger.error('stop_sec error, check it')
-        return
-    ticks = stop_sec * 10 ** 3
-    requests_urllib(f'{scheme}://{netloc}/:/timeline',
-                    decode=True,
-                    headers={'Accept': 'application/json'},
-                    params={
-                        'ratingKey': rating_key,
-                        'state': 'stopped',
-                        # 'state': 'playing',
-                        'time': ticks,
-                        'duration': duration,
-                        'X-Plex-Client-Identifier': client_id,
-                        'X-Plex-Token': api_key,
-                    })
-    if stop_sec > 30:
-        return
-    requests_urllib(f'{scheme}://{netloc}/:/unscrobble',
-                    headers={'Accept': 'application/json'},
-                    params={
-                        'key': rating_key,
-                        'X-Plex-Client-Identifier': client_id,
-                        'X-Plex-Token': api_key,
-                        'identifier': 'com.plexapp.plugins.library',
-                    })
+        raise ValueError('stop_sec error, check it')
+    ticks = int(stop_sec * 10 ** 3)
+    rating_key = str(rating_key)
+    item_key = f'/library/metadata/{rating_key}'
+    host = f'{scheme}://{netloc}'
+    auth = {'X-Plex-Client-Identifier': client_id, 'X-Plex-Token': api_key}
+    headers = {'Accept': 'application/json', 'Cache-Control': 'no-cache'}
+    params = dict(auth, key=rating_key, identifier='com.plexapp.plugins.library')
+
+    def read_item():
+        result = requests_urllib(f'{host}{item_key}', params=auth, headers=headers, get_json=True)
+        items = result.get('MediaContainer', {}).get('Metadata', []) or []
+        return next((ep for ep in items if str(ep.get('ratingKey')) == rating_key), None)
+
+    for attempt in range(2):
+        item = read_item()
+        total_ticks = int(item.get('duration') or duration or 0) if item else 0
+        # Use the same 90% watched convention as sync_third_party_for_eps. Unknown duration
+        # must never cause an item to be marked watched. Preserve the existing short-play rule.
+        completed = stop_sec > 30 and total_ticks > 0 and ticks >= total_ticks * 0.9
+        if item:
+            already_completed = completed and int(item.get('viewCount') or 0) > 0 \
+                and not item.get('viewOffset')
+            if not already_completed:
+                # /timeline can acknowledge a later playlist item without persisting anything.
+                # These endpoints address the item directly, independently of the browser session.
+                requests_urllib(f'{host}/:/progress', params=dict(params, time=ticks), headers=headers)
+                if stop_sec <= 30:
+                    requests_urllib(f'{host}/:/unscrobble', params=params, headers=headers)
+                elif completed:
+                    requests_urllib(f'{host}/:/scrobble', params=params, headers=headers)
+                item = read_item()
+
+        saved_ticks = int(item.get('viewOffset') or 0) if item else None
+        watched = bool(item and int(item.get('viewCount') or 0))
+        saved_position = saved_ticks is not None and abs(saved_ticks - ticks) <= 3000
+        cleared_short_play = stop_sec <= 30 and saved_ticks == 0 and not watched
+        verified = watched if completed else (saved_position or cleared_short_play)
+        if item and verified:
+            logger.info(f'plex progress verified: rating_key={rating_key} requested_ms={ticks} '
+                        f'saved_ms={saved_ticks} watched={watched} completed={completed}')
+            return
+        logger.warn(f'plex progress not saved: rating_key={rating_key} requested_ms={ticks} '
+                    f'saved_ms={saved_ticks} watched={watched} completed={completed} attempt={attempt + 1}/2')
+        if attempt == 0:
+            time.sleep(0.2)
+    # Let the playlist manager retain this episode for the final retry instead of deduplicating it.
+    raise RuntimeError(f'Plex progress verification failed for rating_key={rating_key}')
 
 
 def realtime_playing_request_sender(data, cur_sec, method='playing'):
